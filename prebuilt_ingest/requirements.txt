@@ -1,0 +1,4 @@
+
+opensearch-py==2.7.1
+tqdm==4.66.5
+ujson==5.10.0

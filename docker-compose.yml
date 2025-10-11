@@ -1,0 +1,104 @@
+services:
+
+  opensearch-node1:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: opensearch-node1
+    environment:
+      - cluster.name=opensearch-cluster
+      - node.name=opensearch-node1
+      # SINGLE NODE (do NOT set seed_hosts or initial_master_nodes)
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      # Security ON: set this in .env
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile:  { soft: 65536, hard: 65536 }
+    volumes:
+      - /media/volume/smartsearch-vol/opensearch-data/node1:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    healthcheck:
+      # Wait until the cluster is at least YELLOW using quoted creds
+      test: ["CMD-SHELL", "curl -sk -u \"admin:${OPENSEARCH_INITIAL_ADMIN_PASSWORD}\" https://localhost:9200/_cluster/health?wait_for_status=yellow\\&timeout=5s >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 50
+
+    restart: unless-stopped
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: dashboards
+    environment:
+      - OPENSEARCH_HOSTS=["https://opensearch-node1:9200"]
+      - OPENSEARCH_USERNAME=admin
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+    ports:
+      - "5601:5601"
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # using your attached disk (bind mount)
+      - /media/volume/smartsearch-vol/ollama:/root/.ollama
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    container_name: iguide-search-api
+    env_file: .env
+    environment:
+      - OS_HOST=opensearch-node1
+      - OS_PORT=9200
+      - OS_USER=admin
+      - OS_PASS=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      - INDEX=${OS_INDEX:-iguide_platform}   # <-- add this (or set INDEX: iguide_platform)
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+    ports:
+      - "8088:8088"
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+
+  ui:
+    build: ./ui
+    container_name: iguide-search-ui
+    environment:
+      - SEARCH_API=${SEARCH_API:-http://api:8088}
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  prebuilt_ingest:
+    build: ./prebuilt_ingest
+    container_name: iguide-prebuilt-ingest
+    env_file: .env
+    environment:
+      - OS_HOST=opensearch-node1
+      - OS_PORT=9200
+      - OS_INDEX=${OS_INDEX:-iguide_platform}
+      - OS_USER=admin
+      - OS_PASS=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+    volumes:
+      - ../RagDB:/data/RagDB:ro
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+    # no ports; run ad-hoc when you want to ingest
+
+# Named volumes section not needed since we're using bind mounts
