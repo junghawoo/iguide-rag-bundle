@@ -1,6 +1,7 @@
 import os
 import requests
 import streamlit as st
+import io
 
 API = os.getenv("SEARCH_API", "http://localhost:8088")
 
@@ -28,32 +29,28 @@ def render_hit(h: dict):
     authors = h.get("authors") or []
     tags = h.get("tags") or []
     score = h.get("score", 0.0)
+    thumb = h.get("thumbnail_url")   # <-- NEW
 
     with st.container(border=True):
         col1, col2 = st.columns([4, 1])
 
         with col1:
-            # Title (clickable if URL present)
             if url:
                 st.markdown(f"### [{title}]({url})")
             else:
                 st.markdown(f"### {title}")
 
-            # Abstract / snippet
             if abstract:
-                st.write(_truncate(abstract, 500))
+                st.write(abstract[:500] + ("…" if len(abstract) > 500 else ""))
 
-            # Highlights (from BM25/combined search)
             if highlights:
                 st.markdown("**Matches:** " + " … ".join(highlights))
 
-            # Metadata
             if authors:
                 st.caption("Authors: " + ", ".join(authors))
             if tags:
                 st.caption("Tags: " + ", ".join(tags))
 
-            # Launch button (Streamlit ≥1.25), fallback to markdown link
             if url:
                 try:
                     st.link_button("🚀 Launch on I-GUIDE", url)
@@ -61,10 +58,33 @@ def render_hit(h: dict):
                     st.markdown(f"[🚀 Launch on I-GUIDE]({url})")
 
         with col2:
+            # --- NEW: thumbnail (if present)
+            if thumb:
+                try:
+                    # Try to fetch the image bytes so we control errors/certs/timeouts
+                    resp = requests.get(thumb, timeout=6)
+                    resp.raise_for_status()
+                    img_bytes = io.BytesIO(resp.content)
+                    try:
+                        # Newer Streamlit
+                        st.image(img_bytes, caption="Preview", use_container_width=True)
+                    except TypeError:
+                        # Older Streamlit fallback
+                        st.image(img_bytes, caption="Preview", use_column_width=True)
+                except Exception as e:
+                    # Last resort: try letting Streamlit fetch it directly
+                    try:
+                        st.image(thumb, caption="Preview")
+                    except TypeError:
+                        st.image(thumb, caption="Preview", use_column_width=True)
+                    except Exception:
+                        st.caption("Preview unavailable")
+
+            # Relevance metric under the image
             try:
                 st.metric("Relevance", f"{float(score):.2f}")
             except Exception:
-                st.write("")
+                pass
 
 if st.button("Search") and q.strip():
     with st.spinner("Searching…"):

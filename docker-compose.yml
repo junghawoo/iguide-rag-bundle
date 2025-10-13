@@ -87,6 +87,9 @@ services:
     restart: unless-stopped
 
   prebuilt_ingest:
+
+
+  
     build: ./prebuilt_ingest
     container_name: iguide-prebuilt-ingest
     env_file: .env

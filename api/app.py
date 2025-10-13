@@ -7,6 +7,7 @@ from opensearchpy import OpenSearch, TransportError
 
 # NEW: local embedding (same as the author)
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 
 OS_HOST = os.getenv("OS_HOST", "localhost")
@@ -19,6 +20,8 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 # Embedding model (same one used by the dataset author)
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 DEVICE = "cpu"  # keep CPU for simplicity; switch to "cuda" if you have a GPU
+# For future: automatic device selection
+#DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 app = FastAPI(title="I-GUIDE Notebook Search API")
 
@@ -72,13 +75,41 @@ def _synthesize_link(src: dict, doc_id: str | None) -> str | None:
         return LINK_TEMPLATE.format(element_type=et_pl, doc_id=doc_id)
     return None
 
-def embed_query(text: str) -> list:
-    """Mean-pool the last_hidden_state (same as author's notebook)."""
-    inputs = _tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
+###------------------ Embedding Function -------------------
+def embed_query(text: str) -> list[float]:
+    """Mean-pool over non-pad tokens and L2-normalize (ST-style).
+        Masking pads: Prevents [PAD] vectors (often near zero but not guaranteed) from skewing the mean.
+        Normalization: If you use cosine similarity (e.g., OpenSearch cosinesimil), normalized embeddings make scores consistent and improve nearest-neighbor behavior.
+        No [CLS] pooling: ST defaults to mean pooling; outputs.pooler_output (dense over [CLS]) is not used and typically underperforms for semantic similarity.
+        Truncation: ST uses max_length=512; longer inputs are truncated.
+    """
+    if not text or not text.strip():
+        return [0.0] * 384  # or raise
+
+    inputs = _tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        padding=False,   # single example; no need to pad
+    )
+    input_ids = inputs["input_ids"].to(DEVICE)           # [1, T]
+    attn_mask = inputs["attention_mask"].to(DEVICE)      # [1, T]
+
     with torch.no_grad():
-        outputs = _model(**{k: v.to(DEVICE) for k, v in inputs.items()})
-        vec = outputs.last_hidden_state.mean(dim=1)[0]   # (384,)
-    return vec.cpu().tolist()
+        out = _model(input_ids=input_ids, attention_mask=attn_mask)
+        last_hidden = out.last_hidden_state              # [1, T, 384]
+
+    # mean over *real* tokens only
+    mask = attn_mask.unsqueeze(-1).type_as(last_hidden)  # [1, T, 1]
+    summed = (last_hidden * mask).sum(dim=1)             # [1, 384]
+    counts = mask.sum(dim=1).clamp(min=1.0)              # [1, 1]
+    emb = summed / counts                                # [1, 384]
+
+    # L2-normalize for cosine retrieval (recommended)
+    emb = F.normalize(emb, p=2, dim=1)
+
+    return emb[0].cpu().tolist()
 
 # ------------------ API Schemas ---------------------
 class SearchHit(BaseModel):
@@ -88,6 +119,7 @@ class SearchHit(BaseModel):
     authors: Optional[List[str]] = None
     tags: Optional[List[str]] = None
     notebook_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None      # <-- NEW
     score: float
     highlights: Optional[List[str]] = None
 
@@ -229,6 +261,11 @@ def search(
 
         url = _synthesize_link(src, doc_id)  # <-- always compute
 
+        # --- NEW: pick up thumbnail from common keys
+        thumb = (src.get("thumbnail-image")
+                or src.get("thumbnail_image")
+                or src.get("thumbnail"))
+
         hits.append(SearchHit(
             id = doc_id,
             title = src.get("title","(untitled)"),
@@ -236,6 +273,7 @@ def search(
             authors = src.get("authors"),
             tags = src.get("tags"),
             notebook_url = url,
+            thumbnail_url = thumb,            # <-- NEW
             score = float(h.get("_score", 0.0)),
             highlights = highlights or None,
         ))
