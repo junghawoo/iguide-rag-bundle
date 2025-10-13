@@ -46,6 +46,32 @@ _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
 _model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to(DEVICE)
 _model.eval()
 
+import os
+
+# Element type will be pluralized in code; template has NO trailing "s"
+LINK_TEMPLATE = os.getenv(
+    "LINK_TEMPLATE",
+    "https://platform.i-guide.io/{element_type}/{doc_id}"
+)
+
+def _pluralize_element_type(et: str) -> str:
+    if not et:
+        return ""
+    et = et.strip().lower()
+    # notebook -> notebooks, dataset -> datasets, code stays "code"
+    return "code" if et == "code" else f"{et}s"
+
+def _synthesize_link(src: dict, doc_id: str | None) -> str | None:
+    # Prefer existing link fields if present
+    url = src.get("notebook_url") or src.get("url")
+    if url:
+        return url
+    element_type = src.get("resource-type") or src.get("element_type") or ""
+    et_pl = _pluralize_element_type(element_type)
+    if et_pl and doc_id:
+        return LINK_TEMPLATE.format(element_type=et_pl, doc_id=doc_id)
+    return None
+
 def embed_query(text: str) -> list:
     """Mean-pool the last_hidden_state (same as author's notebook)."""
     inputs = _tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
@@ -186,23 +212,32 @@ def search(
     body_primary = build_rrf_retriever_body_with_client_knn(query_text, k)
     body_bm25    = build_bm25_body(query_text, k)
 
+    # Execute with fallback
     res = search_with_fallback(INDEX, body_primary, body_bm25)
 
     hits = []
     for h in res.get("hits", {}).get("hits", []):
         src = h.get("_source", {}) or {}
+        doc_id = src.get("id") or h.get("_id")
+
+        # collect up to 3 highlight snippets
         highlights = []
-        for v in h.get("highlight", {}).values():
+        for v in (h.get("highlight") or {}).values():
             highlights.extend(v)
+        if highlights:
+            highlights = highlights[:3]
+
+        url = _synthesize_link(src, doc_id)  # <-- always compute
+
         hits.append(SearchHit(
-            id = src.get("id") or h.get("_id"),
+            id = doc_id,
             title = src.get("title","(untitled)"),
-            abstract = src.get("abstract"),  # your docs don’t have this; kept for schema compatibility
+            abstract = src.get("abstract"),
             authors = src.get("authors"),
             tags = src.get("tags"),
-            notebook_url = src.get("notebook_url") or src.get("url"),
+            notebook_url = url,
             score = float(h.get("_score", 0.0)),
-            highlights = highlights[:3] if highlights else None,
+            highlights = highlights or None,
         ))
 
     total = 0

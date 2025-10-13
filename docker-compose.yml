@@ -64,6 +64,8 @@ services:
       - OS_PASS=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
       - INDEX=${OS_INDEX:-iguide_platform}   # <-- add this (or set INDEX: iguide_platform)
       - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - LINK_TEMPLATE=https://platform.i-guide.io/{element_type}/{doc_id}
+      - SYNTHESIZE_LINKS=true
     ports:
       - "8088:8088"
     depends_on:

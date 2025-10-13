@@ -131,9 +131,16 @@ only docker compose down -v would remove named volumes (and even then, bind moun
 
 ## Build & Run 
 - Rebuild/bring up:
+If you only changed code:
+
 ```bash 
-docker compose build
-docker compose up -d
+docker compose build --no-cache api
+docker compose up -d api
+```
+
+-If you changed env vars too (e.g., LINK_TEMPLATE):
+```bash 
+docker compose up -d --force-recreate api
 ```
 
 - Rebuild api 
@@ -142,7 +149,6 @@ docker compose down
 docker compose build --no-cache api
 docker compose up -d
 ```
-
 
 
 ## Notes
