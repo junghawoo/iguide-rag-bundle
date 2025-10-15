@@ -11,15 +11,14 @@ from opensearchpy import OpenSearch, helpers, RequestsHttpConnection
 
 def parse_os_url(os_url: str) -> Tuple[str, int, bool]:
     """
-    Parse --os-url into (host, port, use_ssl)
-    Accepts forms like:
+    Parse --os-url into (host, port, use_ssl).
+    Accepts:
       https://localhost:9200
       http://opensearch-node1:9200
-      localhost:9200 (we'll assume http)
-      opensearch-node1 (default http:9200)
+      localhost:9200 (assume http)
+      opensearch-node1 (assume http:9200)
     """
     if "://" not in os_url:
-        # add default scheme
         if ":" in os_url:
             host, port_s = os_url.split(":", 1)
             return host, int(port_s), False
@@ -107,14 +106,17 @@ def recreate_index(
     if client.indices.exists(index=index):
         client.indices.delete(index=index)
     ensure_index(
-        client, index, create_mapping=True, vector_field=vector_field, dim=dim, replicas=replicas
+        client,
+        index=index,
+        create_mapping=True,
+        vector_field=vector_field,
+        dim=dim,
+        replicas=replicas,
     )
 
 
 def l2_normalize(vec):
-    # Normalize to unit length (avoid divide by zero)
     import math
-
     s = math.fsum(v * v for v in vec)
     if s <= 0.0:
         return vec
@@ -159,44 +161,40 @@ def apply_renames(doc: dict, renames: Dict[str, str]) -> dict:
     return doc
 
 
-def gen_actions(
-    jsonl_path: str,
-    index: str,
-    id_field: str,
-    vector_field: str,
-    dim: int,
-    normalize: bool,
-    renames: Dict[str, str],
-) -> Iterable[dict]:
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
+def gen_actions(args):
+    """
+    Yields bulk actions. Pops the chosen id field out of _source and uses it as _id.
+    Applies optional renames and vector normalization.
+    """
+    import math
+    renames = parse_field_renames(args.rename or [])
+
+    with open(args.jsonl, "r", encoding="utf-8") as f:
+        for line in f:
             line = line.strip()
             if not line:
                 continue
-            try:
-                doc = json.loads(line)
-            except Exception as e:
-                sys.stderr.write(f"[line {lineno}] JSON error: {e}\n")
-                continue
+            doc = json.loads(line)
 
-            # rename fields if requested
+            # 1) determine document _id (and POP it out of _source)
+            _id = None
+            if getattr(args, "id_field", None) and args.id_field in doc:
+                _id = str(doc.pop(args.id_field))
+            elif "_id" in doc:
+                _id = str(doc.pop("_id"))
+
+            # 2) optional field renames
             if renames:
                 doc = apply_renames(doc, renames)
 
-            # coerce vector
-            raw_vec = doc.get(vector_field)
-            vec = coerce_vector(raw_vec, dim=dim, normalize=normalize)
-            if vec is None:
-                sys.stderr.write(
-                    f"[line {lineno}] skip: missing/invalid '{vector_field}' "
-                    f"(dim expected {dim})\n"
-                )
-                continue
-            doc[vector_field] = vec
+            # 3) optional L2-normalize the vector field
+            vfield = getattr(args, "vector_field", None)
+            if getattr(args, "normalize", False) and vfield and isinstance(doc.get(vfield), list):
+                v = doc[vfield]
+                n = math.sqrt(sum((x * x) for x in v)) or 1.0
+                doc[vfield] = [x / n for x in v]
 
-            # id (optional)
-            _id = str(doc.get(id_field)) if id_field and doc.get(id_field) is not None else None
-            yield {"_index": index, "_id": _id, "_source": doc}
+            yield {"_index": args.index, "_id": _id or None, "_source": doc}
 
 
 def main():
@@ -207,7 +205,7 @@ def main():
     p.add_argument("--jsonl", required=True, help="Path to JSONL")
     p.add_argument(
         "--os-url",
-        default=os.getenv("OS_URL", ""),  # prefer explicit URL
+        default=os.getenv("OS_URL", ""),
         help="OpenSearch URL, e.g., https://localhost:9200 (overrides host/port)",
     )
     p.add_argument("--host", default=os.getenv("OS_HOST", "opensearch-node1"))
@@ -287,41 +285,21 @@ def main():
             replicas=args.replicas,
         )
 
-    # Field rename map
-    renames = parse_field_renames(args.rename)
-
     # Bulk ingest
-    actions = gen_actions(
-        jsonl_path=args.jsonl,
-        index=args.index,
-        id_field=args.id_field,
-        vector_field=args.vector_field,
-        dim=args.dim,
-        normalize=args.normalize,
-        renames=renames,
-    )
-
     success, failed = helpers.bulk(
         client,
-        actions,
+        gen_actions(args),
         chunk_size=args.batch,
-        request_timeout=300,
-        raise_on_error=False,
-        stats_only=True,
+        request_timeout=120,
+        refresh="wait_for" if args.refresh else False,
     )
-    # force refresh if asked
-    if args.refresh:
-        client.indices.refresh(index=args.index)
 
-    # final count & summary
+    # final summary
     try:
         count = client.count(index=args.index)["count"]
     except Exception:
         count = "?"
-    print(
-        f"RESULT: success={success} failed={failed} index={args.index} count={count}",
-        file=sys.stderr,
-    )
+    print(f"RESULT: success={success} failed={failed} index={args.index} count={count}")
 
 
 if __name__ == "__main__":

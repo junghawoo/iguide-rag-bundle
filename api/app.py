@@ -1,62 +1,55 @@
 import os, requests
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from opensearchpy import OpenSearch, TransportError
 
-# NEW: local embedding (same as the author)
+# --- Local embedding (author's model) ---
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 
-OS_HOST = os.getenv("OS_HOST", "localhost")
+# ------------------ Config ------------------
+OS_HOST = os.getenv("OS_HOST", "opensearch-node1")  # match compose service name
 OS_PORT = int(os.getenv("OS_PORT", "9200"))
 OS_USER = os.getenv("OS_USER")
 OS_PASS = os.getenv("OS_PASS")
 INDEX = os.getenv("OS_INDEX") or os.getenv("INDEX") or "iguide_platform"
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
-# Embedding model (same one used by the dataset author)
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
-DEVICE = "cpu"  # keep CPU for simplicity; switch to "cuda" if you have a GPU
-# For future: automatic device selection
-#DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "384"))  # keep in sync with mapping
+DEVICE = "cpu"  # set to "cuda" if you have a GPU
 
+LINK_TEMPLATE = os.getenv("LINK_TEMPLATE", "https://platform.i-guide.io/{element_type}/{doc_id}")
+
+# ------------------ App init ------------------
 app = FastAPI(title="I-GUIDE Notebook Search API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# If security is enabled, use_ssl should be True.
+# OpenSearch client (security enabled => HTTPS)
 auth = (OS_USER, OS_PASS) if OS_USER and OS_PASS else None
 os_client = OpenSearch(
     hosts=[{"host": OS_HOST, "port": OS_PORT}],
     http_auth=auth,
     use_ssl=True,
     verify_certs=False,       # self-signed in local compose
-    ssl_show_warn=False,      # suppress urllib3 InsecureRequestWarning noise
-    timeout=30
+    ssl_show_warn=False,
+    timeout=30,
 )
 
-# ---- Embedding init (matches author's notebook) ----
+# ---- Embedding init ----
 _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
 _model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to(DEVICE)
 _model.eval()
 
-import os
-
-# Element type will be pluralized in code; template has NO trailing "s"
-LINK_TEMPLATE = os.getenv(
-    "LINK_TEMPLATE",
-    "https://platform.i-guide.io/{element_type}/{doc_id}"
-)
-
+# ------------------ Helpers ------------------
 def _pluralize_element_type(et: str) -> str:
     if not et:
         return ""
@@ -64,8 +57,7 @@ def _pluralize_element_type(et: str) -> str:
     # notebook -> notebooks, dataset -> datasets, code stays "code"
     return "code" if et == "code" else f"{et}s"
 
-def _synthesize_link(src: dict, doc_id: str | None) -> str | None:
-    # Prefer existing link fields if present
+def _synthesize_link(src: dict, doc_id: Optional[str]) -> Optional[str]:
     url = src.get("notebook_url") or src.get("url")
     if url:
         return url
@@ -75,43 +67,30 @@ def _synthesize_link(src: dict, doc_id: str | None) -> str | None:
         return LINK_TEMPLATE.format(element_type=et_pl, doc_id=doc_id)
     return None
 
-###------------------ Embedding Function -------------------
-def embed_query(text: str) -> list[float]:
-    """Mean-pool over non-pad tokens and L2-normalize (ST-style).
-        Masking pads: Prevents [PAD] vectors (often near zero but not guaranteed) from skewing the mean.
-        Normalization: If you use cosine similarity (e.g., OpenSearch cosinesimil), normalized embeddings make scores consistent and improve nearest-neighbor behavior.
-        No [CLS] pooling: ST defaults to mean pooling; outputs.pooler_output (dense over [CLS]) is not used and typically underperforms for semantic similarity.
-        Truncation: ST uses max_length=512; longer inputs are truncated.
-    """
-    if not text or not text.strip():
-        return [0.0] * 384  # or raise
+def _pick_thumbnail(src: dict) -> Optional[str]:
+    return src.get("thumbnail-image") or src.get("thumbnail_image") or src.get("thumbnail")
 
-    inputs = _tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-        padding=False,   # single example; no need to pad
-    )
-    input_ids = inputs["input_ids"].to(DEVICE)           # [1, T]
-    attn_mask = inputs["attention_mask"].to(DEVICE)      # [1, T]
+# ------------------ Embedding ------------------
+def embed_query(text: str) -> List[float]:
+    """Mean-pool over non-pad tokens and L2-normalize (ST-style)."""
+    if not text or not text.strip():
+        return [0.0] * EMBED_DIM
+
+    enc = _tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=False)
+    input_ids = enc["input_ids"].to(DEVICE)
+    attn_mask = enc["attention_mask"].to(DEVICE)
 
     with torch.no_grad():
-        out = _model(input_ids=input_ids, attention_mask=attn_mask)
-        last_hidden = out.last_hidden_state              # [1, T, 384]
+        last = _model(input_ids=input_ids, attention_mask=attn_mask).last_hidden_state  # [1,T,EMBED_DIM]
 
-    # mean over *real* tokens only
-    mask = attn_mask.unsqueeze(-1).type_as(last_hidden)  # [1, T, 1]
-    summed = (last_hidden * mask).sum(dim=1)             # [1, 384]
-    counts = mask.sum(dim=1).clamp(min=1.0)              # [1, 1]
-    emb = summed / counts                                # [1, 384]
-
-    # L2-normalize for cosine retrieval (recommended)
+    mask = attn_mask.unsqueeze(-1).type_as(last)  # [1,T,1]
+    summed = (last * mask).sum(dim=1)             # [1,EMBED_DIM]
+    counts = mask.sum(dim=1).clamp(min=1.0)       # [1,1]
+    emb = summed / counts                         # [1,EMBED_DIM]
     emb = F.normalize(emb, p=2, dim=1)
-
     return emb[0].cpu().tolist()
 
-# ------------------ API Schemas ---------------------
+# ------------------ Schemas ------------------
 class SearchHit(BaseModel):
     id: str
     title: str
@@ -119,7 +98,7 @@ class SearchHit(BaseModel):
     authors: Optional[List[str]] = None
     tags: Optional[List[str]] = None
     notebook_url: Optional[str] = None
-    thumbnail_url: Optional[str] = None      # <-- NEW
+    thumbnail_url: Optional[str] = None
     score: float
     highlights: Optional[List[str]] = None
 
@@ -128,35 +107,31 @@ class SearchResponse(BaseModel):
     rewritten_query: Optional[str] = None
     total: int
     hits: List[SearchHit]
+    mode: Optional[str] = None  # "retriever" or "bm25"
 
-# ----------------- LLM Rewrite (optional) -----------
+# ------------------ LLM rewrite ------------------
 def rewrite_query_with_llm(q: str) -> str:
     try:
         resp = requests.post(
             f"{OLLAMA_HOST}/api/generate",
-            json={
-                "model": "qwen2.5:3b-instruct",
-                "prompt": f"Rewrite this as a concise search query for research notebooks: {q}"
-            },
+            json={"model": "qwen2.5:3b-instruct",
+                  "prompt": f"Rewrite this as a concise search query for research notebooks: {q}"},
             timeout=10,
         )
         if resp.ok:
-            text = resp.json().get("response", "").strip()
-            return text or q
-        return q
+            t = resp.json().get("response", "").strip()
+            return t or q
     except Exception:
-        return q
+        pass
+    return q
 
-# ----------------- Query Builders -------------------
+# ------------------ Query builders ------------------
 def _lexical_query(q: str) -> dict:
-    """
-    BM25 across real fields + exact author boost on authors.keyword.
-    """
     mm = {
         "multi_match": {
             "query": q,
             "fields": ["title^3", "contents^1.5", "tags^1.2", "authors^1.2"],
-            "type": "best_fields"
+            "type": "best_fields",
         }
     }
     author_exact = {"term": {"authors.keyword": {"value": q, "case_insensitive": True}}}
@@ -168,23 +143,20 @@ def build_bm25_body(q: str, k: int) -> dict:
         "query": _lexical_query(q),
         "highlight": {
             "pre_tags": ["<mark>"], "post_tags": ["</mark>"],
-            "fields": {"contents": {}, "title": {}, "tags": {}, "authors": {}}
-        }
+            "fields": {"contents": {}, "title": {}, "tags": {}, "authors": {}},
+        },
     }
 
 def build_rrf_retriever_body_with_client_knn(q: str, k: int) -> dict:
-    """
-    Hybrid RRF using retriever API (OpenSearch 2.12+).
-    Uses client-side query embedding (NO server-side model needed).
-    """
     lexical = _lexical_query(q)
     qvec = embed_query(q)
+    num_cand = min(10000, max(k * 5, 100))  # keep within OS limits
 
     knn = {
-        "field": "contents-embedding",   # your vector field (dim 384)
+        "field": "contents-embedding",
         "query_vector": qvec,
         "k": k,
-        "num_candidates": max(k * 5, 100)
+        "num_candidates": num_cand,
     }
 
     return {
@@ -193,37 +165,36 @@ def build_rrf_retriever_body_with_client_knn(q: str, k: int) -> dict:
             "rrf": {
                 "retrievers": [
                     {"standard": {"query": lexical}},
-                    {"knn": {"query": knn}}
+                    {"knn": {"query": knn}},
                 ]
             }
         },
         "highlight": {
             "pre_tags": ["<mark>"], "post_tags": ["</mark>"],
-            "fields": {"contents": {}, "title": {}, "tags": {}, "authors": {}}
-        }
+            "fields": {"contents": {}, "title": {}, "tags": {}, "authors": {}},
+        },
     }
 
 def _fallback_worthy(exc: Exception) -> bool:
-    s = str(exc) if exc else ""
-    s_lower = s.lower()
-    return ("parsing_exception" in s_lower) or ("retriever" in s_lower) or ("unknown key" in s_lower)
+    s = (str(exc) or "").lower()
+    return ("parsing_exception" in s) or ("retriever" in s) or ("unknown key" in s)
 
-def search_with_fallback(index: str, primary_body: dict, bm25_body: dict) -> dict:
-    """
-    Try the new 'retriever' body first; if the cluster rejects it, retry with BM25.
-    """
+def search_with_fallback(index: str, primary_body: dict, bm25_body: dict) -> Tuple[dict, str]:
     try:
-        return os_client.search(index=index, body=primary_body)
+        res = os_client.search(index=index, body=primary_body)
+        return res, "retriever"
     except TransportError as e:
         if _fallback_worthy(e):
-            return os_client.search(index=index, body=bm25_body)
+            res = os_client.search(index=index, body=bm25_body)
+            return res, "bm25"
         raise
     except Exception as e:
         if _fallback_worthy(e):
-            return os_client.search(index=index, body=bm25_body)
+            res = os_client.search(index=index, body=bm25_body)
+            return res, "bm25"
         raise
 
-# --------------------- Routes -----------------------
+# ------------------ Routes ------------------
 @app.get("/health")
 def health():
     try:
@@ -231,6 +202,7 @@ def health():
         return {"ok": True, "opensearch": pong.get("status"), "index": INDEX}
     except Exception as e:
         return {"ok": False, "error": str(e), "index": INDEX}
+
 
 @app.get("/search", response_model=SearchResponse)
 def search(
@@ -240,54 +212,181 @@ def search(
 ):
     query_text = rewrite_query_with_llm(q) if use_llm else q
 
-    # Build both bodies (primary = hybrid RRF w/ client-side KNN; fallback = BM25)
-    body_primary = build_rrf_retriever_body_with_client_knn(query_text, k)
-    body_bm25    = build_bm25_body(query_text, k)
+    # --- Build BM25 body ---
+    body_bm25 = build_bm25_body(query_text, k)
 
-    # Execute with fallback
-    res = search_with_fallback(INDEX, body_primary, body_bm25)
+    # --- Build kNN body (client-side embedding) ---
+    try:
+        qvec = embed_query(query_text)
+    except Exception:
+        qvec = None
 
-    hits = []
-    for h in res.get("hits", {}).get("hits", []):
+    body_knn = {
+        "size": k,
+        "query": {"knn": {"contents-embedding": {"vector": qvec or [0.0]*EMBED_DIM, "k": k}}},
+        "_source": True,
+        "highlight": {
+            "pre_tags": ["<mark>"], "post_tags": ["</mark>"],
+            "fields": {"contents": {}, "title": {}, "tags": {}, "authors": {}},
+        },
+    }
+
+    mode = "hybrid-rrf-client"
+    try:
+        bm25_res = os_client.search(index=INDEX, body=body_bm25)
+        knn_res  = os_client.search(index=INDEX, body=body_knn) if qvec is not None else {"hits": {"hits": []}}
+
+        # --- RRF fuse ---
+        def rank_map(hits): return {h["_id"]: i for i, h in enumerate(hits)}
+        b_hits = bm25_res.get("hits", {}).get("hits", []) or []
+        k_hits = knn_res.get("hits", {}).get("hits", []) or []
+        b_rank, k_rank = rank_map(b_hits), rank_map(k_hits)
+
+        ids = set(b_rank) | set(k_rank)
+        k_param = 60
+        fused = []
+        for _id in ids:
+            score = 0.0
+            if _id in b_rank: score += 1.0 / (k_param + b_rank[_id] + 1)
+            if _id in k_rank: score += 1.0 / (k_param + k_rank[_id] + 1)
+
+            # choose representative source & merge highlights
+            src = None
+            hl = {}
+
+            if _id in b_rank:
+                hb = b_hits[b_rank[_id]]
+                src = hb.get("_source", src)
+                for kf, arr in (hb.get("highlight") or {}).items():
+                    hl.setdefault(kf, []).extend(arr)
+
+            if _id in k_rank:
+                hk = k_hits[k_rank[_id]]
+                if src is None:
+                    src = hk.get("_source")
+                for kf, arr in (hk.get("highlight") or {}).items():
+                    hl.setdefault(kf, []).extend(arr)
+
+            fused.append({"_id": _id, "_source": src, "_score": score, "highlight": hl})
+
+        fused.sort(key=lambda x: x["_score"], reverse=True)
+        res_hits = fused[:k]
+
+        # union-ish total (approx)
+        total = max(
+            bm25_res.get("hits", {}).get("total", {}).get("value", 0) if isinstance(bm25_res.get("hits", {}).get("total"), dict) else 0,
+            knn_res.get("hits", {}).get("total", {}).get("value", 0) if isinstance(knn_res.get("hits", {}).get("total"), dict) else 0
+        )
+
+    except Exception:
+        # Absolute fallback to BM25 only
+        bm25_only = os_client.search(index=INDEX, body=body_bm25)
+        res_hits = bm25_only.get("hits", {}).get("hits", [])
+        total = bm25_only.get("hits", {}).get("total", {}).get("value", 0) if isinstance(bm25_only.get("hits", {}).get("total"), dict) else 0
+        mode = "bm25"
+
+    # --- Build response hits ---
+    hits: List[SearchHit] = []
+    for h in res_hits:
         src = h.get("_source", {}) or {}
         doc_id = src.get("id") or h.get("_id")
 
-        # collect up to 3 highlight snippets
+        # highlights (<=3)
         highlights = []
         for v in (h.get("highlight") or {}).values():
             highlights.extend(v)
         if highlights:
             highlights = highlights[:3]
 
-        url = _synthesize_link(src, doc_id)  # <-- always compute
-
-        # --- NEW: pick up thumbnail from common keys
-        thumb = (src.get("thumbnail-image")
-                or src.get("thumbnail_image")
-                or src.get("thumbnail"))
+        url = _synthesize_link(src, doc_id)
+        thumb = _pick_thumbnail(src)
 
         hits.append(SearchHit(
-            id = doc_id,
-            title = src.get("title","(untitled)"),
-            abstract = src.get("abstract"),
-            authors = src.get("authors"),
-            tags = src.get("tags"),
-            notebook_url = url,
-            thumbnail_url = thumb,            # <-- NEW
-            score = float(h.get("_score", 0.0)),
-            highlights = highlights or None,
+            id=doc_id,
+            title=src.get("title", "(untitled)"),
+            abstract=src.get("abstract"),
+            authors=src.get("authors"),
+            tags=src.get("tags"),
+            notebook_url=url,
+            thumbnail_url=thumb,
+            score=float(h.get("_score", 0.0)),
+            highlights=highlights or None,
         ))
-
-    total = 0
-    total_obj = res.get("hits", {}).get("total")
-    if isinstance(total_obj, dict):
-        total = int(total_obj.get("value", 0))
-    elif isinstance(total_obj, int):
-        total = total_obj
 
     return SearchResponse(
         query=q,
         rewritten_query=(query_text if use_llm else None),
         total=total,
-        hits=hits
+        hits=hits,
+        mode=mode,
     )
+
+
+
+
+# --- add these builders ---
+def build_knn_body(qvec: list[float], k: int) -> dict:
+    return {
+        "size": k,
+        "query": {
+            "knn": {
+                "contents-embedding": {
+                    "vector": qvec,
+                    "k": k
+                }
+            }
+        },
+        "_source": True,
+        "highlight": {
+            "pre_tags": ["<mark>"], "post_tags": ["</mark>"],
+            "fields": {"contents": {}, "title": {}, "tags": {}, "authors": {}},
+        },
+    }
+
+def fetch_bm25(index: str, q: str, k: int) -> dict:
+    body = build_bm25_body(q, k)
+    return os_client.search(index=index, body=body)
+
+def fetch_knn(index: str, q: str, k: int) -> dict:
+    qvec = embed_query(q)
+    body = build_knn_body(qvec, k)
+    return os_client.search(index=index, body=body)
+
+def rrf_fuse(bm25_res: dict, knn_res: dict, k: int, k_param: int = 60) -> list[dict]:
+    """
+    Reciprocal Rank Fusion on two ranked lists.
+    score = sum( 1 / (k_param + rank) )
+    Returns top-k fused hits with merged highlights and a fused score.
+    """
+    def rank_map(hits):
+        return {h["_id"]: i for i, h in enumerate(hits)}
+
+    b_hits = bm25_res.get("hits", {}).get("hits", []) or []
+    k_hits = knn_res.get("hits", {}).get("hits", []) or []
+
+    b_rank = rank_map(b_hits)
+    k_rank = rank_map(k_hits)
+
+    ids = set(b_rank) | set(k_rank)
+    fused = []
+    for _id in ids:
+        r = 1.0 / (k_param + b_rank[_id] + 1) if _id in b_rank else 0.0
+        r += 1.0 / (k_param + k_rank[_id] + 1) if _id in k_rank else 0.0
+
+        # merge representative hit pieces
+        src = None; hl = {}
+        # prefer whichever list has the better (lower) rank
+        if _id in b_rank:
+            h = b_hits[b_rank[_id]]
+            src = h.get("_source", src)
+            hl.update(h.get("highlight") or {})
+        if _id in k_rank:
+            h = k_hits[k_rank[_id]]
+            if src is None: src = h.get("_source")
+            for key, arr in (h.get("highlight") or {}).items():
+                hl.setdefault(key, []).extend(arr)
+
+        fused.append({"_id": _id, "_source": src, "_score": r, "highlight": hl})
+
+    fused.sort(key=lambda x: x["_score"], reverse=True)
+    return fused[:k]
