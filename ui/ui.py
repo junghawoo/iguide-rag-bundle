@@ -104,6 +104,34 @@ if st.button("Search") and q.strip():
 
     total = data.get("total", 0)
     hits = data.get("hits", []) or []
+    summary = data.get("summary")
+    summary_err = data.get("summary_error")
+
+    # If a summary is present (LLM used), show it above results and render a safe list of notebooks
+    if summary:
+        st.markdown("### Summary")
+        # Render LLM summary as Markdown so markdown links (if any) are clickable
+        try:
+            st.markdown(summary)
+        except Exception:
+            st.write(summary)
+
+        # Also provide an explicit list of representative notebooks using the OpenSearch hits
+        st.markdown("**Representative notebooks:**")
+        if hits:
+            for hh in hits[:10]:
+                t = hh.get("title") or "(untitled)"
+                u = hh.get("notebook_url")
+                if u:
+                    st.markdown(f"- [{t}]({u})")
+                else:
+                    st.markdown(f"- {t}")
+        else:
+            st.markdown("(no representative notebooks found)")
+
+        st.markdown("---")
+    elif summary_err:
+        st.warning(f"Summary generation failed: {summary_err}")
 
     st.subheader(f"Top {len(hits)} of {total} results")
     for h in hits:

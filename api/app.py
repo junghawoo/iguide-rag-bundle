@@ -1,4 +1,4 @@
-import os, requests
+import os, requests, json, re
 from typing import List, Optional, Tuple
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -108,6 +108,9 @@ class SearchResponse(BaseModel):
     total: int
     hits: List[SearchHit]
     mode: Optional[str] = None  # "retriever" or "bm25"
+    summary: Optional[str] = None
+    summary_error: Optional[str] = None
+    raw_summary: Optional[str] = None
 
 # ------------------ LLM rewrite ------------------
 def rewrite_query_with_llm(q: str) -> str:
@@ -116,7 +119,7 @@ def rewrite_query_with_llm(q: str) -> str:
             f"{OLLAMA_HOST}/api/generate",
             json={"model": "qwen2.5:3b-instruct",
                   "prompt": f"Rewrite this as a concise search query for research notebooks: {q}"},
-            timeout=10,
+            timeout=30,
         )
         if resp.ok:
             t = resp.json().get("response", "").strip()
@@ -124,6 +127,130 @@ def rewrite_query_with_llm(q: str) -> str:
     except Exception:
         pass
     return q
+
+
+def generate_summary_with_llm(q: str, top_titles: Optional[List[str]] = None, debug_raw: bool = False) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Generate a concise multi-paragraph summary for the query and include short mentions of top matching notebooks.
+    Returns (summary, error); one of them will be None.
+    """
+    titles_text = ""
+    if top_titles:
+        # top_titles may be title strings or (title, url) tuples
+        def fmt(t):
+            # If we have a (title, url) tuple, format as a Markdown link so UI renders clickable links
+            if isinstance(t, (list, tuple)) and len(t) >= 2 and t[1]:
+                return f"- [{t[0]}]({t[1]})"
+            return f"- {t}"
+        # separate each bullet with a blank line for readability
+        titles_text = "\n\nRepresentative notebooks:\n\n" + "\n\n".join(fmt(t) for t in top_titles[:6])
+
+    prompt = (
+        f"Provide a concise Markdown summary (2-5 short paragraphs) describing how to find or work with '{q}' in the context of research notebooks."
+        " Use normal English spacing and punctuation. Do NOT insert spaces inside words or inside multi-digit numbers (for example, write 'Imagery' not 'Imag ery' and write '1990' not '1 9 9 0')."
+        " Do NOT add spaces before or inside domain names or URLs (for example, write 'i-guide.io' not 'i -guide .io')."
+        " Mention common methods, data sources, and tools a researcher would try, in clear short paragraphs."
+    " Then include a 'Representative notebooks' bullet list (3-5 items) using only the exact titles and URLs provided below — do NOT invent new titles, dataset names, or external URLs."
+    " Ensure there is a blank line between each bullet in the 'Representative notebooks' list (i.e., separate bullets with one empty line)."
+        f"{titles_text}\n\nOutput valid Markdown only and keep the summary under ~300 words."
+    )
+
+    # Safer consolidated post-processing used for both JSON and NDJSON paths.
+    def reflow_safe(t: str) -> str:
+        t0 = t.strip()
+        # Keep paragraph structure where possible
+        parts = re.split(r"\n{2,}", t0)
+        word_counts = [len(p.split()) for p in parts if p.strip()]
+        avg = (sum(word_counts) / len(word_counts)) if word_counts else 999
+
+        if avg < 6:
+            # fragmented: try to preserve existing spaces but avoid aggressive merging
+            s = re.sub(r"\s+", " ", t0)
+            sentences = re.split(r"(?<=[.!?])\s+", s)
+            para_chunks = [" ".join(sentences[i:i+2]) for i in range(0, len(sentences), 2)]
+            out = "\n\n".join(para_chunks).strip()
+            # small cleanup of common punctuation spacing
+            out = re.sub(r"\s+([,\.:;\)\]])", r"\1", out)
+            out = re.sub(r"([\(\[\{])\s+", r"\1", out)
+            out = re.sub(r"(?<=\w)\s*\.\s*(?=\w)", ".", out)
+            return out
+
+        s = re.sub(r"\n{3,}", "\n\n", t0)
+        s = re.sub(r"[ \t]{2,}", " ", s)
+        s = re.sub(r"(\w)\n(\w)", r"\1 \2", s)
+
+        # conservative repairs only
+        s = re.sub(r"(?:(?<=\D)|^)(\d(?:[ \n]\d){3,})(?=\D|$)", lambda m: re.sub(r"[ \n]", "", m.group(1)), s)
+        s = re.sub(r"\s*-\s*", "-", s)
+        s = re.sub(r"\s+([,\.:;\)\]])", r"\1", s)
+        s = re.sub(r"([\(\[\{])\s+", r"\1", s)
+        s = re.sub(r"(?<=\w)\s*\.\s*(?=\w)", ".", s)
+        s = re.sub(r"\n{3,}", "\n\n", s)
+        s = re.sub(r"[ \t]{2,}", " ", s)
+        return s.strip()
+
+    try:
+        resp = requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={
+                "model": "qwen2.5:3b-instruct",
+                "prompt": prompt,
+                "temperature": 0.0,
+                "max_tokens": 512,
+                "stream": False,
+            },
+            timeout=60,
+        )
+    except Exception as e:
+        return None, str(e), None
+
+    raw_text_resp = None
+    try:
+        raw_text_resp = resp.text
+    except Exception:
+        raw_text_resp = None
+
+    if not resp.ok:
+        try:
+            err_text = resp.text
+        except Exception:
+            err_text = f"status={resp.status_code}"
+        return None, f"HTTP {resp.status_code}: {err_text}", raw_text_resp
+
+    # Try regular JSON first
+    try:
+        body = resp.json()
+        # common Ollama returns {"response": "..."}
+        txt = reflow_safe(body.get("response", "") or "")
+        return txt or None, None, raw_text_resp
+    except Exception:
+        # Could be NDJSON or streaming lines; fallthrough to manual parse
+        pass
+
+    # Handle NDJSON / line-delimited JSON (collect 'response' fields or plain text lines)
+    try:
+        text = resp.text
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        # Try parse each line as JSON and extract any 'response' or 'text' fields
+        collected = []
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+                if isinstance(obj, dict):
+                    if "response" in obj and obj["response"]:
+                        collected.append(obj["response"]) 
+                    elif "text" in obj and obj["text"]:
+                        collected.append(obj["text"]) 
+            except Exception:
+                # not JSON, treat as raw text
+                collected.append(ln)
+
+        if collected:
+            txt = reflow_safe("\n\n".join(collected).strip())
+            return txt or None, None, raw_text_resp
+    except Exception as e:
+        return None, str(e), raw_text_resp
+
+    return None, None, raw_text_resp
 
 # ------------------ Query builders ------------------
 def _lexical_query(q: str) -> dict:
@@ -209,6 +336,7 @@ def search(
     q: str = Query(..., description="User query"),
     use_llm: bool = Query(False, description="Rewrite query with LLM first?"),
     k: int = Query(10, ge=1, le=50),
+    debug_raw_summary: bool = Query(False, description="Return raw LLM generator output as raw_summary for debugging"),
 ):
     query_text = rewrite_query_with_llm(q) if use_llm else q
 
@@ -313,12 +441,33 @@ def search(
             highlights=highlights or None,
         ))
 
+    # Optionally generate a short summary with the LLM when requested
+    summary: Optional[str] = None
+    if use_llm:
+        try:
+            # pass title + notebook_url when available so LLM uses only these exact items
+            top_titles = []
+            for h in hits[:6]:
+                t = h.title
+                u = h.notebook_url if getattr(h, "notebook_url", None) else None
+                if t:
+                    top_titles.append((t, u) if u else t)
+            summary, summary_err, raw = generate_summary_with_llm(query_text, top_titles, debug_raw=debug_raw_summary)
+        except Exception:
+            summary = None
+            summary_err = "exception"
+    else:
+        summary_err = None
+    
     return SearchResponse(
         query=q,
         rewritten_query=(query_text if use_llm else None),
         total=total,
         hits=hits,
         mode=mode,
+        summary=summary,
+        summary_error=summary_err,
+        raw_summary=(raw if debug_raw_summary else None),
     )
 
 
