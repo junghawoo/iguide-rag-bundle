@@ -24,6 +24,15 @@ DEVICE = "cpu"  # set to "cuda" if you have a GPU
 
 LINK_TEMPLATE = os.getenv("LINK_TEMPLATE", "https://platform.i-guide.io/{element_type}/{doc_id}")
 
+LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").lower()  # "anvilgpt" or "ollama"
+
+ANVILGPT_BASE = os.getenv("ANVILGPT_BASE", "https://anvilgpt.rcac.purdue.edu/api").rstrip("/")
+ANVILGPT_MODEL = os.getenv("ANVILGPT_MODEL", "llama3.2:latest")
+ANVILGPT_API_KEY = os.getenv("ANVILGPT_API_KEY")
+ANVILGPT_VERIFY = os.getenv("ANVILGPT_VERIFY", "true").lower() != "false"  # set to false only if you must
+
+
+
 # ------------------ App init ------------------
 app = FastAPI(title="I-GUIDE Notebook Search API")
 
@@ -114,34 +123,73 @@ class SearchResponse(BaseModel):
 
 # ------------------ LLM rewrite ------------------
 def rewrite_query_with_llm(q: str) -> str:
-    try:
-        resp = requests.post(
-            f"{OLLAMA_HOST}/api/generate",
-            json={"model": "qwen2.5:3b-instruct",
-                  "prompt": f"Rewrite this as a concise search query for research notebooks: {q}"},
-            timeout=30,
-        )
-        if resp.ok:
-            t = resp.json().get("response", "").strip()
-            return t or q
-    except Exception:
-        pass
+    messages = [
+        {"role": "system", "content": "You rewrite user input as a concise search query for research notebooks."},
+        {"role": "user", "content": q},
+    ]
+    resp = _call_llm_chat(messages, temperature=0.0, max_tokens=64, stream=False)
+    if "text" in resp and resp["text"].strip():
+        return resp["text"].strip()
     return q
+
+
+def _call_llm_chat(messages, *, temperature=0.0, max_tokens=512, stream=False) -> dict:
+    """
+    Unified LLM caller. If LLM_BACKEND=anvilgpt, call its OpenAI-compatible
+    /api/chat/completions endpoint. Otherwise fall back to Ollama /api/chat.
+    Returns a dict with either {"text": "..."} or {"error": "...", "raw": "..."}.
+    """
+    try:
+        if LLM_BACKEND == "anvilgpt":
+            if not ANVILGPT_API_KEY:
+                return {"error": "ANVILGPT_API_KEY missing"}
+            url = f"{ANVILGPT_BASE}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {ANVILGPT_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "model": ANVILGPT_MODEL,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": stream,
+            }
+            r = requests.post(url, headers=headers, json=body, timeout=60, verify=ANVILGPT_VERIFY)
+            if not r.ok:
+                return {"error": f"HTTP {r.status_code}: {r.text}", "raw": r.text}
+            data = r.json()
+            text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            return {"text": text}
+
+        # ---- Ollama fallback ----
+        url = f"{OLLAMA_HOST}/api/chat"
+        body = {
+            "model": "qwen2.5:3b-instruct",
+            "messages": messages,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+            "stream": stream,
+        }
+        r = requests.post(url, json=body, timeout=60)
+        if not r.ok:
+            return {"error": f"HTTP {r.status_code}: {r.text}", "raw": r.text}
+        data = r.json()
+        text = (data.get("message") or {}).get("content", "")
+        return {"text": text}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def generate_summary_with_llm(q: str, top_titles: Optional[List[str]] = None, debug_raw: bool = False) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Generate a concise multi-paragraph summary for the query and include short mentions of top matching notebooks.
-    Returns (summary, error); one of them will be None.
+    Returns (summary, error, raw_summary).
     """
     titles_text = ""
     if top_titles:
-        # top_titles may be title strings or (title, url) tuples
         def fmt(t):
-            # If we have a (title, url) tuple, format as a Markdown link so UI renders clickable links
             if isinstance(t, (list, tuple)) and len(t) >= 2 and t[1]:
                 return f"- [{t[0]}]({t[1]})"
             return f"- {t}"
-        # separate each bullet with a blank line for readability
         titles_text = "\n\nRepresentative notebooks:\n\n" + "\n\n".join(fmt(t) for t in top_titles[:6])
 
     prompt = (
@@ -149,26 +197,23 @@ def generate_summary_with_llm(q: str, top_titles: Optional[List[str]] = None, de
         " Use normal English spacing and punctuation. Do NOT insert spaces inside words or inside multi-digit numbers (for example, write 'Imagery' not 'Imag ery' and write '1990' not '1 9 9 0')."
         " Do NOT add spaces before or inside domain names or URLs (for example, write 'i-guide.io' not 'i -guide .io')."
         " Mention common methods, data sources, and tools a researcher would try, in clear short paragraphs."
-    " Then include a 'Representative notebooks' bullet list (3-5 items) using only the exact titles and URLs provided below — do NOT invent new titles, dataset names, or external URLs."
-    " Ensure there is a blank line between each bullet in the 'Representative notebooks' list (i.e., separate bullets with one empty line)."
+        " Then include a 'Representative notebooks' bullet list (3-5 items) using only the exact titles and URLs provided below — do NOT invent new titles, dataset names, or external URLs."
+        " Ensure there is a blank line between each bullet in the 'Representative notebooks' list (i.e., separate bullets with one empty line)."
         f"{titles_text}\n\nOutput valid Markdown only and keep the summary under ~300 words."
     )
 
-    # Safer consolidated post-processing used for both JSON and NDJSON paths.
+    # light, safe cleanup to avoid weird spacing/line-break artifacts
     def reflow_safe(t: str) -> str:
         t0 = t.strip()
-        # Keep paragraph structure where possible
         parts = re.split(r"\n{2,}", t0)
         word_counts = [len(p.split()) for p in parts if p.strip()]
         avg = (sum(word_counts) / len(word_counts)) if word_counts else 999
 
         if avg < 6:
-            # fragmented: try to preserve existing spaces but avoid aggressive merging
             s = re.sub(r"\s+", " ", t0)
             sentences = re.split(r"(?<=[.!?])\s+", s)
             para_chunks = [" ".join(sentences[i:i+2]) for i in range(0, len(sentences), 2)]
             out = "\n\n".join(para_chunks).strip()
-            # small cleanup of common punctuation spacing
             out = re.sub(r"\s+([,\.:;\)\]])", r"\1", out)
             out = re.sub(r"([\(\[\{])\s+", r"\1", out)
             out = re.sub(r"(?<=\w)\s*\.\s*(?=\w)", ".", out)
@@ -177,8 +222,6 @@ def generate_summary_with_llm(q: str, top_titles: Optional[List[str]] = None, de
         s = re.sub(r"\n{3,}", "\n\n", t0)
         s = re.sub(r"[ \t]{2,}", " ", s)
         s = re.sub(r"(\w)\n(\w)", r"\1 \2", s)
-
-        # conservative repairs only
         s = re.sub(r"(?:(?<=\D)|^)(\d(?:[ \n]\d){3,})(?=\D|$)", lambda m: re.sub(r"[ \n]", "", m.group(1)), s)
         s = re.sub(r"\s*-\s*", "-", s)
         s = re.sub(r"\s+([,\.:;\)\]])", r"\1", s)
@@ -189,68 +232,21 @@ def generate_summary_with_llm(q: str, top_titles: Optional[List[str]] = None, de
         return s.strip()
 
     try:
-        resp = requests.post(
-            f"{OLLAMA_HOST}/api/generate",
-            json={
-                "model": "qwen2.5:3b-instruct",
-                "prompt": prompt,
-                "temperature": 0.0,
-                "max_tokens": 512,
-                "stream": False,
-            },
-            timeout=60,
-        )
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that writes concise, well-formatted Markdown for researchers."},
+            {"role": "user", "content": prompt}
+        ]
+        resp_obj = _call_llm_chat(messages, temperature=0.0, max_tokens=512, stream=False)
     except Exception as e:
         return None, str(e), None
 
-    raw_text_resp = None
-    try:
-        raw_text_resp = resp.text
-    except Exception:
-        raw_text_resp = None
+    if "error" in resp_obj:
+        return None, resp_obj["error"], None
 
-    if not resp.ok:
-        try:
-            err_text = resp.text
-        except Exception:
-            err_text = f"status={resp.status_code}"
-        return None, f"HTTP {resp.status_code}: {err_text}", raw_text_resp
+    raw_text = resp_obj.get("text", "") or ""
+    out = reflow_safe(raw_text) if raw_text else ""
+    return (out or None), None, (raw_text if debug_raw else None)
 
-    # Try regular JSON first
-    try:
-        body = resp.json()
-        # common Ollama returns {"response": "..."}
-        txt = reflow_safe(body.get("response", "") or "")
-        return txt or None, None, raw_text_resp
-    except Exception:
-        # Could be NDJSON or streaming lines; fallthrough to manual parse
-        pass
-
-    # Handle NDJSON / line-delimited JSON (collect 'response' fields or plain text lines)
-    try:
-        text = resp.text
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        # Try parse each line as JSON and extract any 'response' or 'text' fields
-        collected = []
-        for ln in lines:
-            try:
-                obj = json.loads(ln)
-                if isinstance(obj, dict):
-                    if "response" in obj and obj["response"]:
-                        collected.append(obj["response"]) 
-                    elif "text" in obj and obj["text"]:
-                        collected.append(obj["text"]) 
-            except Exception:
-                # not JSON, treat as raw text
-                collected.append(ln)
-
-        if collected:
-            txt = reflow_safe("\n\n".join(collected).strip())
-            return txt or None, None, raw_text_resp
-    except Exception as e:
-        return None, str(e), raw_text_resp
-
-    return None, None, raw_text_resp
 
 # ------------------ Query builders ------------------
 def _lexical_query(q: str) -> dict:

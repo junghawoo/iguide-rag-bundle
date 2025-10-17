@@ -22,3 +22,6 @@ __pycache__/
 .ipynb_checkpoints/
 # OS/IDE
 .idea/
+
+# Ignore all files and subdirectories under test/
+test/

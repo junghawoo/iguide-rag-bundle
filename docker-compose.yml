@@ -16,7 +16,7 @@ services:
       memlock: { soft: -1, hard: -1 }
       nofile:  { soft: 65536, hard: 65536 }
     volumes:
-      - /media/volume/smartsearch-vol/opensearch-data/node1:/usr/share/opensearch/data
+      - /media/volume/smartsearch-vol-data/opensearch-data/node1:/usr/share/opensearch/data
     ports:
       - "9200:9200"
       - "9600:9600"
@@ -50,7 +50,7 @@ services:
       - "11434:11434"
     volumes:
       # using your attached disk (bind mount)
-      - /media/volume/smartsearch-vol/ollama:/root/.ollama
+      - /media/volume/smartsearch-vol-data/ollama:/root/.ollama
     restart: unless-stopped
 
   api:
@@ -63,6 +63,10 @@ services:
       - OS_USER=admin
       - OS_PASS=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
       - INDEX=${OS_INDEX:-iguide_platform}   # <-- add this (or set INDEX: iguide_platform)
+      - LLM_BACKEND=anvilgpt                  # anvilgpt | ollama
+      - ANVILGPT_BASE=https://anvilgpt.rcac.purdue.edu/api
+      - ANVILGPT_API_KEY=${ANVILGPT_API_KEY}  # put in your .env
+      - ANVILGPT_MODEL=llama3.2:latest
       - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       - LINK_TEMPLATE=https://platform.i-guide.io/{element_type}/{doc_id}
       - SYNTHESIZE_LINKS=true
