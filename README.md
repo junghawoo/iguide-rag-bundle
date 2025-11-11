@@ -98,8 +98,20 @@ Your documents should include:
 ### Loading prebuilt embeddings 
 Load the JSONL (uses your existing index name in .env, defaults to iguide_platform)
 ```bash 
-docker compose run --rm prebuilt_ingest \
-  python load_jsonl.py --jsonl /data/RagDB/i_guide_spatial_embedding_export.jsonl
+ docker compose run --rm prebuilt_ingest \
+  python3 load_jsonl.py \
+    --jsonl /data/RagDB/i_guide_spatial_embedding_export.jsonl \
+    --os-url https://opensearch-node1:9200 \
+    --user admin \
+    --password 'your_password' \
+    --insecure \
+    --index iguide_platform \
+    --recreate \
+    --vector-field contents-embedding \
+    --dim 384 \
+    --normalize \
+    --batch 1000 \
+    --refresh
 
 ```
 The loaded embeddings in OpenSearch are not deleted by docker compose down.
